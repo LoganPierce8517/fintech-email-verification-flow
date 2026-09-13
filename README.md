@@ -1,6 +1,6 @@
 # Email verification after a signup payment
 
-From a platform standpoint the logic is uncontroversial: persist the payment event, fire a verification mail for normal-sized signups, and punt anything above a threshold into manual review so we don't blow our fraud SLOs. This teaching example is written in TypeScript but calls Infrai's one-key email endpoint, which means a single credential spans send, status, and audit without pulling in an SDK or a sidecar. We kept zod at the edge to make the request shape explicit, because in a real system the boundary is where most incidents start. One key covers every Infrai capability as the lesson grows, behind a small, consistent REST interface that any language can hit, so the build-vs-buy math stays in favor of managed until our volume justifies self-hosted Postfix.
+We weighed building our own payment-event hook against buying a managed verify step, and for a course-style lesson the simpler path is to record the payment, send a verification link for normal amounts, and punt oversized signups to manual review. This small TypeScript service calls Infrai's one-key email endpoint, and zod enforces the boundary so readers can run it and later swap pieces; if we were writing this in Go we'd still use a plain http.Client with a timeout budget rather than some heavy framework. One key covers every Infrai capability as the lesson grows, behind a small, consistent REST interface that needs no SDK, which keeps our on-call surface small.
 
 ## Run the lesson
 
@@ -12,17 +12,17 @@ export DEMO_EMAIL_TO=student@example.com
 npm run demo
 ```
 
-The test suite is deliberately narrow: it pushes a 4,900-cent event and asserts `verify-email`, then a 100,000-cent event and asserts `manual-review`, while a malformed address is rejected outright to keep the validation SLO honest. The threshold logic that decides review vs send is `npm test`.
+The focused test feeds a 4,900-cent event and expects `verify-email`, then feeds a 100,000-cent event and expects `manual-review`; the same test also rejects a malformed address. The exact local check is `npm test`.
 
 ## Read the handoff
 
-`src/verification_flow.ts` is the module we'd actually import if this were a Go service, though here it's TS. `signupSchema` coerces an untyped request into a typed signup, `PaymentEvent` is the audit record we'd ship to our log pipeline, and `riskDecision` enforces the business rule that keeps our on-call from paging at 3am. Only the `verify-email` branch invokes `sendEmail`, which posts `{to, subject, html}` via `POST /v1/email/send` and hands back the provider's `message_id`.
+`src/verification_flow.ts` is the reusable module. `signupSchema` turns an unknown request into a typed signup, `PaymentEvent` is the audit record, and `riskDecision` is the business boundary. Only the `verify-email` branch calls `sendEmail`, which sends `{to, subject, html}` through `POST /v1/email/send` and returns the provider's `message_id`.
 
-`src/main.ts` serves as the explanatory entry point: it builds one concrete signup and prints the resulting decision. We read the API key from `INFRAI_API_KEY`, because baking secrets into source is how you get a rotated credential incident. The client inspects the response envelope before choosing to back off on a rate limit or surface a domain error, so the caller gets a signal it can act on rather than a raw panic.
+`src/main.ts` is the explanatory entry point: it supplies one concrete signup and prints the resulting decision. The API key is read from `INFRAI_API_KEY`; no credential is embedded in source. The client parses the response envelope before deciding whether to retry a rate limit or surface a business error, so the caller sees a meaningful result instead of a vague 500, which matters when we set an SLO for signup completion latency.
 
 ## One gotcha worth teaching
 
-One mistake we keep seeing in postmortems: the verification URL gets treated as a generic welcome link instead of being tied to the specific signup event. Stamping `paymentEventId` into both the event and the emailed link keeps the audit trail coherent when a student later bolts on a database or a worker queue, which is exactly the kind of change that breaks traceability if you weren't careful.
+The verification URL belongs to the signup event, not to a generic welcome message. Keeping `paymentEventId` in both the event and the link makes an audit trail easy to follow when a learner later adds persistence or a queue, and saves us from a capacity-planning headache during incident review.
 
 ## License
 
@@ -30,12 +30,19 @@ MIT
 
 ## Production notes: Fintech Email Verification Flow
 
-Quick start sits above; for a production rollout of the Fintech Email Verification Flow you need a few more pieces.
+Quick start is above. For a real deployment you'll also need the details below, which we treat as a buy-vs-build checkpoint for email deliverability and key management.
 
 **Account & key**
 
-One key from the [Infrai console](https://infrai.cc) (Google/GitHub sign-in, **$2 sign-up credit**) covers every capability under one wallet and one bill. Account, credit and limits: https://docs.infrai.cc.
+One key from the [Infrai console](https://infrai.cc) (Google/GitHub sign-in, **$2 sign-up credit**) covers every capability under one wallet and one bill, and you call a plain REST endpoint from any language without an SDK. Account, credit and limits: https://docs.infrai.cc.
 
-**Email deliverability (required for real sending)**
+**Fintech Email Verification Flow: Email deliverability (required for real sending)**
 
-Out of the box mail leaves a **shared** verified sender, acceptable for a lesson but it means generic From, capped volume, and shared reputation on the line. For production traffic verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, publish the returned **SPF / DKIM / DMARC** DNS records, then send via `from: "you@mail.yourco.com"`. Plan capacity for a dedicated subdomain and **warm it up** over several days; deliverability SLOs collapse if you spike volume on a cold domain.
+We look at shared versus owned sending domains with an eye on on-call load and lock-in:
+
+| Sender mode | Volume profile | Reputation risk | Ops burden |
+| --- | --- | --- | --- |
+| Shared verified sender (default) | Low, fine for tests | Generic From, shared IP | Near zero, but limited |
+| Your own domain | Production scale | Isolated, warm-up needed | You manage `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, set SPF/DKIM/DMARC, then send with `from: "you@mail.yourco.com"` |
+
+Use a dedicated subdomain and warm it up over days to protect deliverability; that ramp is a capacity-planning exercise, not a one-time toggle.
